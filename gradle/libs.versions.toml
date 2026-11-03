@@ -24,4 +24,4 @@ testcontainers-localstack = { module = "org.testcontainers:localstack", version.
 testcontainers-junit-jupiter = { module = "org.testcontainers:junit-jupiter", version.ref = "testcontainers" }
 
 [plugins]
-graalvm = { id = "org.graalvm.buildtools.native", version = "0.10.3" }
+graalvm = { id = "org.graalvm.buildtools.native", version = "1.1.18" }
