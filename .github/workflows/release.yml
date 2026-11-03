@@ -1,0 +1,321 @@
+name: Release
+
+# Every push to main (i.e. every merged PR) publishes a new tag vX.Y.Z and a
+# GitHub Release. The bump comes from #major/#minor/#patch/#none keywords in
+# the PR / commits / labels (default: minor); see scripts/next-version.sh.
+#
+# Flow: version -> (unit tests, integration tests) -> (native builds + JVM zip,
+# each smoke-tested) -> release. The tag only exists if everything succeeded.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Override the bump (auto = derive from PR / commits / labels)"
+        type: choice
+        options: [auto, major, minor, patch, none]
+        default: auto
+
+# Serialise releases so version numbers and tags never race. Queued runs are
+# not cancelled once started (note: GitHub keeps only one *pending* run per
+# group, so a burst of merges may skip intermediate runs; the next run covers
+# every commit since the last tag).
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  LANG: C.UTF-8
+  LC_ALL: C.UTF-8
+
+jobs:
+  version:
+    name: Compute version
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      release: ${{ steps.compute.outputs.release }}
+      version: ${{ steps.compute.outputs.version }}
+      bump: ${{ steps.compute.outputs.bump }}
+      base: ${{ steps.compute.outputs.base }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # all history and tags
+      - name: Compute version
+        id: compute
+        # PR title/body are untrusted: they are fetched with `gh api`, written
+        # to files and parsed by scripts/next-version.sh. They are never
+        # interpolated into this script.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BUMP_INPUT: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/next-version"
+          mkdir -p "$dir"
+          : > "$dir/pr-text"
+          : > "$dir/labels"
+          : > "$dir/commits"
+
+          # Re-run on a commit that already carries a release tag: do nothing.
+          if git tag --points-at "$SHA" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::notice::$SHA is already released; skipping."
+            {
+              echo "bump=none"
+              echo "base="
+              echo "version="
+              echo "release=false"
+              echo "reason=already-released"
+            } | tee -a "$GITHUB_OUTPUT"
+            echo "Commit \`$SHA\` is already released; nothing to do." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # 1. The merged PR for this commit (merge, squash and rebase merges
+          #    all associate the resulting head commit with the PR).
+          pr_json=""
+          for attempt in 1 2 3; do
+            pr_json="$(gh api "repos/$REPO/commits/$SHA/pulls" --paginate \
+              | jq -cs --arg sha "$SHA" --arg base "$DEFAULT_BRANCH" '
+                  add // []
+                  | map(select(.merged_at != null and .base.ref == $base)) as $merged
+                  | (($merged | map(select(.merge_commit_sha == $sha))) + $merged)[0] // empty')"
+            [ -n "$pr_json" ] && break
+            [ "$attempt" -lt 3 ] && sleep 5
+          done
+
+          if [ -n "$pr_json" ]; then
+            number="$(jq -r '.number' <<<"$pr_json")"
+            echo "Found PR #$number"
+            jq -r '.title // ""' <<<"$pr_json" >> "$dir/pr-text"
+            jq -r '.body // ""' <<<"$pr_json" >> "$dir/pr-text"
+            jq -r '.labels[].name' <<<"$pr_json" >> "$dir/labels"
+            gh api "repos/$REPO/pulls/$number/commits" --paginate --jq '.[].commit.message' >> "$dir/commits"
+          else
+            echo "No PR associated with $SHA (direct push)."
+          fi
+
+          # 2. Commit messages of THIS push only (before..sha); if `before` is
+          #    all zeros / unknown: just the head commit. Deliberately not
+          #    "since the last tag": that would carry an earlier PR's #none
+          #    into the next PR and wrongly skip its release. To redo a failed
+          #    release with a specific bump, use workflow_dispatch.
+          if [ -n "$BEFORE" ] && ! [[ "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE^{commit}" 2> /dev/null; then
+            range=("$BEFORE..$SHA")
+          else
+            range=(-1 "$SHA")
+          fi
+          git log --format=%B "${range[@]}" >> "$dir/commits"
+
+          # 3. Compute.
+          args=(--text-file "$dir/pr-text" --text-file "$dir/commits" --labels-file "$dir/labels")
+          if [ -n "$BUMP_INPUT" ]; then args+=(--bump "$BUMP_INPUT"); fi
+          scripts/next-version.sh "${args[@]}" | tee "$dir/result" >> "$GITHUB_OUTPUT"
+
+          get() { sed -n "s/^$1=//p" "$dir/result"; }
+          {
+            echo "## Version"
+            echo
+            if [ "$(get release)" = "true" ]; then
+              echo "**v$(get version)** ($(get bump) bump from v$(get base), reason: \`$(get reason)\`)"
+            else
+              echo "No release: bump is \`none\` (reason: \`$(get reason)\`)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  unit-tests:
+    name: Unit tests (gradle build)
+    needs: version
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v5
+      - run: ./gradlew build
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: |
+            **/build/reports/tests/
+            **/build/test-results/
+          if-no-files-found: ignore
+
+  integration-tests:
+    name: Integration tests
+    needs: version
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v5
+      - run: ./gradlew integrationTest
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-reports
+          path: |
+            **/build/reports/tests/
+            **/build/test-results/
+          if-no-files-found: ignore
+
+  native:
+    name: Native ${{ matrix.asset }}
+    needs: [version, unit-tests, integration-tests]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    # Linux builds run in Oracle Linux 8 (glibc 2.28) so the binaries run on
+    # the UNAS Pro, whose glibc is older than Oracle Linux 9's. Empty = no
+    # container (macOS).
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - asset: glacier-backup-linux-arm64
+            runner: ubuntu-24.04-arm
+            container: ghcr.io/graalvm/native-image-community:21-ol8
+            locale: C.utf8
+          - asset: glacier-backup-linux-amd64
+            runner: ubuntu-latest
+            container: ghcr.io/graalvm/native-image-community:21-ol8
+            locale: C.utf8
+          - asset: glacier-backup-macos-arm64
+            runner: macos-latest # arm64
+            container: ""
+            locale: en_US.UTF-8
+    env:
+      # native-image bakes sun.jnu.encoding at BUILD time: a non-UTF-8 locale
+      # here makes the binary mangle non-ASCII filenames at runtime.
+      LANG: ${{ matrix.locale }}
+      LC_ALL: ${{ matrix.locale }}
+      VERSION: ${{ needs.version.outputs.version }}
+      ASSET: ${{ matrix.asset }}
+    steps:
+      - name: Install tooling (container)
+        if: matrix.container != ''
+        run: microdnf install -y findutils git tar gzip
+      - uses: actions/checkout@v4
+      - name: Set up GraalVM (macOS)
+        if: matrix.container == ''
+        uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: "21"
+          distribution: graalvm-community
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: gradle/actions/setup-gradle@v5
+      - name: Build native image
+        run: ./gradlew :cli:nativeCompile "-Pversion=$VERSION"
+      - name: Stage binary
+        run: |
+          mkdir dist
+          cp cli/build/native/nativeCompile/glacier-backup "dist/$ASSET"
+          chmod +x "dist/$ASSET"
+      - name: Smoke test --version
+        run: |
+          expected="glacier-backup $VERSION"
+          actual="$("./dist/$ASSET" --version)"
+          echo "version output: '$actual' (expected: '$expected')"
+          test "$actual" = "$expected"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  jvm-dist:
+    name: JVM distribution zip
+    needs: [version, unit-tests, integration-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v5
+      - run: ./gradlew :cli:distZip "-Pversion=$VERSION"
+      - name: Stage zip
+        run: |
+          mkdir dist
+          cp "cli/build/distributions/glacier-backup-$VERSION.zip" dist/
+      - name: Smoke test --version
+        run: |
+          unzip -q "dist/glacier-backup-$VERSION.zip" -d "$RUNNER_TEMP/jvm-dist"
+          launcher="$(find "$RUNNER_TEMP/jvm-dist" -path '*/bin/glacier-backup' -type f | head -n 1)"
+          test -n "$launcher"
+          expected="glacier-backup $VERSION"
+          actual="$("$launcher" --version)"
+          echo "version output: '$actual' (expected: '$expected')"
+          test "$actual" = "$expected"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glacier-backup-jvm-zip
+          path: dist/glacier-backup-${{ env.VERSION }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Tag and publish release
+    needs: [version, native, jvm-dist]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the tag and the release (GITHUB_TOKEN only)
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.version.outputs.version }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          ls -l
+          sha256sum "glacier-backup-linux-arm64" "glacier-backup-linux-amd64" \
+            "glacier-backup-macos-arm64" "glacier-backup-$VERSION.zip" > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create tag and release
+        run: |
+          tag="v$VERSION"
+          if gh api "repos/$GH_REPO/git/ref/tags/$tag" > /dev/null 2>&1; then
+            echo "::error::Tag $tag already exists"
+            exit 1
+          fi
+          # --target with a SHA creates the tag on exactly the tested commit.
+          gh release create "$tag" dist/* \
+            --target "$SHA" \
+            --title "$tag" \
+            --generate-notes
+          echo "Published [$tag](https://github.com/$GH_REPO/releases/tag/$tag)" >> "$GITHUB_STEP_SUMMARY"

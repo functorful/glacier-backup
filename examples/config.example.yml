@@ -1,0 +1,76 @@
+# glacier-backup example configuration.
+#
+# Default locations searched when --config is not given (first match wins):
+#   1. $XDG_CONFIG_HOME/glacier-backup/config.yml
+#      (falls back to ~/.config/glacier-backup/config.yml)
+#   2. /etc/glacier-backup/config.yml
+# Or pass an explicit file:  glacier-backup --config ./config.yml sync photos
+#
+# AWS credentials are NOT part of this file; they come from the standard AWS
+# credential chain (environment variables, ~/.aws/credentials, ...).
+
+# --- Required -------------------------------------------------------------
+
+# Name of an existing S3 bucket to upload into.
+bucket: my-glacier-backup-bucket
+
+# AWS region the bucket lives in.
+region: eu-west-1
+
+# --- Optional -------------------------------------------------------------
+
+defaults:
+  # S3 storage class for uploaded objects. One of:
+  #   STANDARD, GLACIER_IR, GLACIER, DEEP_ARCHIVE
+  # Default: DEEP_ARCHIVE (cheapest; restores take hours).
+  storageClass: DEEP_ARCHIVE
+
+  # Number of threads used to scan the local directory tree (1-128).
+  # Default: 32. Lower it on small machines or slow spinning disks.
+  scanThreads: 32
+
+# Each key under backupSets is a backup set name. Sync one with
+#   glacier-backup sync <name>      (add --dry-run to only print the plan)
+backupSets:
+
+  # A minimal set: only `local` and `prefix` are required.
+  photos:
+    # Local directory to back up.
+    local: /srv/photos
+    # Key prefix in the bucket. Use a trailing slash; every file is uploaded
+    # as <prefix><path relative to `local`>.
+    prefix: photos/
+
+  # A set with filters.
+  documents:
+    local: /srv/documents
+    prefix: documents/
+
+    # Optional. If non-empty, only files matching at least one include glob
+    # are synced. Omit (or leave empty) to include everything.
+    include:
+      - "**/*.pdf"
+      - "**/*.odt"
+      - "notes/**"
+
+    # Optional. Files matching any exclude glob are skipped. Exclude always
+    # wins over include.
+    #
+    # Globs are matched against the path relative to `local`, using Java glob
+    # syntax. `*` never crosses a directory separator, and `**/x` needs at
+    # least one leading directory - so write both a bare form (matches at the
+    # set root) and a **/-prefixed form (matches in subdirectories).
+    exclude:
+      - ".DS_Store"
+      - "**/.DS_Store"
+      - "Thumbs.db"
+      - "**/Thumbs.db"
+      - "tmp/**"
+      - "**/tmp/**"
+      - "*.tmp"
+      - "**/*.tmp"
+      # Live SQLite sidecar files change mid-upload and are useless alone.
+      - "*.db-wal"
+      - "**/*.db-wal"
+      - "*.db-shm"
+      - "**/*.db-shm"
