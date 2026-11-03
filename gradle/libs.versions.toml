@@ -1,5 +1,5 @@
 [versions]
-micronaut = "4.6.3"
+micronaut = "5.2.4"
 picocli = "4.7.6"
 awssdk = "2.29.9"
 assertj = "3.26.3"
