@@ -28,17 +28,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"
-      - uses: gradle/actions/setup-gradle@v5
+      - uses: gradle/actions/setup-gradle@v6
       # `build` = compile + unit tests + memoryTest (wired into check).
       - run: ./gradlew build
       - name: Upload test reports
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unit-test-reports
           path: |
@@ -51,16 +51,16 @@ jobs:
     runs-on: ubuntu-latest # Docker is preinstalled (Testcontainers + LocalStack)
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"
-      - uses: gradle/actions/setup-gradle@v5
+      - uses: gradle/actions/setup-gradle@v6
       - run: ./gradlew integrationTest
       - name: Upload test reports
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: integration-test-reports
           path: |
@@ -73,7 +73,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: glacier-backup-run.test.sh
         run: bash scripts/glacier-backup-run.test.sh
       - name: next-version.test.sh
@@ -100,8 +100,8 @@ jobs:
       # Gradle cache need them and the minimal image may lack them.
       - name: Install tooling
         run: microdnf install -y findutils git tar gzip
-      - uses: actions/checkout@v4
-      - uses: gradle/actions/setup-gradle@v5
+      - uses: actions/checkout@v7
+      - uses: gradle/actions/setup-gradle@v6
       - name: Build native image
         run: ./gradlew :cli:nativeCompile "-Pversion=$SMOKE_VERSION"
       - name: Assert --version
@@ -116,7 +116,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # full history + tags: base version and commit messages
       - name: Compute bump
