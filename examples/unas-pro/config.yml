@@ -1,0 +1,61 @@
+# glacier-backup configuration for a UniFi UNAS Pro.
+#
+# Install on the NAS as /etc/glacier-backup/config.yml (scripts/setup-unas.sh
+# does this for you: CONFIG=examples/unas-pro/config.yml ./scripts/setup-unas.sh).
+#
+# Finding the paths for `local:` - ssh to the UNAS and list the UniFi Drive
+# shares. Each share is a directory under
+#   /volume/<volume-uuid>/.srv/.unifi-drive/<ShareName>
+# so:
+#   ssh root@unas 'ls -d /volume/*/.srv/.unifi-drive/*'
+# prints one line per share. The <volume-uuid> is the same for all shares on
+# the same storage pool; replace every <volume-uuid> below with it.
+#
+# Credentials are not stored here: setup-unas.sh writes /root/.aws/credentials.
+
+bucket: my-glacier-backup-bucket
+region: eu-west-1
+
+defaults:
+  # Restores from DEEP_ARCHIVE take up to ~48 hours; use GLACIER or GLACIER_IR
+  # if you want faster (more expensive) access.
+  storageClass: DEEP_ARCHIVE
+  # The UNAS Pro is a small machine; fewer scan threads keep memory down.
+  scanThreads: 16
+
+# Set names are what the runner script (glacier-backup-run) cycles through, in
+# this order. Exclude globs need both a bare and a **/-prefixed form: `*` never
+# crosses a directory separator in Java glob syntax.
+backupSets:
+  photos:
+    local: /volume/<volume-uuid>/.srv/.unifi-drive/Photos
+    prefix: photos/
+    exclude:
+      - ".DS_Store"
+      - "**/.DS_Store"
+      - "@eaDir/**"
+      - "**/@eaDir/**"
+      - "#recycle/**"
+      - "**/#recycle/**"
+
+  documents:
+    local: /volume/<volume-uuid>/.srv/.unifi-drive/Documents
+    prefix: documents/
+    exclude:
+      - ".DS_Store"
+      - "**/.DS_Store"
+      - "@eaDir/**"
+      - "**/@eaDir/**"
+      - "#recycle/**"
+      - "**/#recycle/**"
+
+  media:
+    local: /volume/<volume-uuid>/.srv/.unifi-drive/Media
+    prefix: media/
+    exclude:
+      - ".DS_Store"
+      - "**/.DS_Store"
+      - "@eaDir/**"
+      - "**/@eaDir/**"
+      - "#recycle/**"
+      - "**/#recycle/**"

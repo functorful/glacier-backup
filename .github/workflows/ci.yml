@@ -1,0 +1,174 @@
+name: CI
+
+# Pull-request checks. Releases are cut by release.yml on push to main.
+#
+# edited/labeled/unlabeled are included so the "release preview" reflects the
+# current PR title, body and labels (which drive the version bump). They rerun
+# the whole workflow; superseded runs are cancelled by `concurrency`.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Tests (and the native image build) require a UTF-8 locale.
+  LANG: C.UTF-8
+  LC_ALL: C.UTF-8
+
+jobs:
+  unit-tests:
+    name: Unit tests (gradle build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v5
+      # `build` = compile + unit tests + memoryTest (wired into check).
+      - run: ./gradlew build
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: |
+            **/build/reports/tests/
+            **/build/test-results/
+          if-no-files-found: ignore
+
+  integration-tests:
+    name: Integration tests
+    runs-on: ubuntu-latest # Docker is preinstalled (Testcontainers + LocalStack)
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v5
+      - run: ./gradlew integrationTest
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-reports
+          path: |
+            **/build/reports/tests/
+            **/build/test-results/
+          if-no-files-found: ignore
+
+  shell:
+    name: Shell tests and shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: glacier-backup-run.test.sh
+        run: bash scripts/glacier-backup-run.test.sh
+      - name: next-version.test.sh
+        run: bash scripts/next-version.test.sh
+      - name: shellcheck
+        run: shellcheck --severity=warning scripts/*.sh
+
+  native-smoke:
+    name: Native smoke build (linux-arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    container:
+      # Oracle Linux 8 (glibc 2.28): the binary must run on the UNAS Pro, whose
+      # glibc is older than Oracle Linux 9's.
+      image: ghcr.io/graalvm/native-image-community:21-ol8
+    env:
+      # native-image bakes sun.jnu.encoding at BUILD time, so the build needs a
+      # UTF-8 locale or the binary mangles non-ASCII filenames at runtime.
+      LANG: C.utf8
+      LC_ALL: C.utf8
+      SMOKE_VERSION: 0.0.0
+    steps:
+      # findutils: gradlew needs xargs. git/tar/gzip: actions/checkout and the
+      # Gradle cache need them and the minimal image may lack them.
+      - name: Install tooling
+        run: microdnf install -y findutils git tar gzip
+      - uses: actions/checkout@v4
+      - uses: gradle/actions/setup-gradle@v5
+      - name: Build native image
+        run: ./gradlew :cli:nativeCompile "-Pversion=$SMOKE_VERSION"
+      - name: Assert --version
+        run: |
+          expected="glacier-backup $SMOKE_VERSION"
+          actual="$(./cli/build/native/nativeCompile/glacier-backup --version)"
+          echo "version output: '$actual' (expected: '$expected')"
+          test "$actual" = "$expected"
+
+  release-preview:
+    name: Release preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags: base version and commit messages
+      - name: Compute bump
+        # PR title/body are untrusted: they only ever reach the shell through
+        # env vars and are written to files, never interpolated into the script.
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/next-version"
+          mkdir -p "$dir"
+
+          printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" > "$dir/pr-text"
+          jq -r '.[]' <<<"$PR_LABELS_JSON" > "$dir/labels"
+
+          if [ -n "$PR_BASE_SHA" ] && [ -n "$PR_HEAD_SHA" ]; then
+            git log --format=%B "$PR_BASE_SHA..$PR_HEAD_SHA" > "$dir/commits"
+          else
+            # workflow_dispatch: compare the selected ref with the default branch.
+            git log --format=%B "origin/$DEFAULT_BRANCH..HEAD" > "$dir/commits"
+          fi
+
+          scripts/next-version.sh \
+            --text-file "$dir/pr-text" --text-file "$dir/commits" \
+            --labels-file "$dir/labels" > "$dir/result"
+
+          get() { sed -n "s/^$1=//p" "$dir/result"; }
+          bump="$(get bump)"
+          base="$(get base)"
+          version="$(get version)"
+          reason="$(get reason)"
+
+          {
+            echo "## Release preview"
+            echo
+            if [ "$(get release)" = "true" ]; then
+              echo "Merging this into \`$DEFAULT_BRANCH\` would publish **v$version** ($bump bump from v$base)."
+            else
+              echo "Merging this into \`$DEFAULT_BRANCH\` would **not** publish a release (\`none\`)."
+            fi
+            echo
+            case "$reason" in
+              default) echo "No bump keyword found, so the default (\`minor\`) applies." ;;
+              keywords:*) echo "Keywords found: \`${reason#keywords:}\` (highest of major, minor, patch wins; \`none\` only applies when it is the only keyword)." ;;
+              *) echo "Reason: \`$reason\`." ;;
+            esac
+            echo
+            echo "Control the bump with \`#major\`, \`#minor\`, \`#patch\` or \`#none\` in the PR title, PR body, a commit message, or a label (\`major\`, \`bump:patch\`, ...)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$dir/result"
